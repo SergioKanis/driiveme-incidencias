@@ -1,0 +1,325 @@
+{
+  "name": "Agente de incidencias operativas",
+  "nodes": [
+    {
+      "id": "359f1422-7aff-4081-a7d5-26d56b424c23",
+      "name": "Webhook: nueva incidencia",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "2b3ee401-c211-431c-a15d-7d965eb6b774",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incidencia",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "d4d1a712-309c-45fd-9f09-09ea77d78bb1",
+      "name": "Preparar petición a Claude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Construye la petición a la API de Claude con tool use forzado (salida JSON garantizada).\nconst texto = $json.body?.incidencia ?? $json.incidencia ?? '';\nconst esquema = {\n  type: 'object',\n  properties: {\n    tipo: { type: 'string', enum: ['averia','accidente_danos','retraso','cliente_ausente','llaves_documentacion','combustible_carga','cambio_cita','otro'] },\n    resumen: { type: 'string' },\n    emisor: { type: 'string', enum: ['conductor','cliente','interno','desconocido'] },\n    matricula: { type: ['string','null'] },\n    modelo_vehiculo: { type: ['string','null'] },\n    conductor: { type: ['string','null'] },\n    telefono_contacto: { type: ['string','null'] },\n    cliente: { type: ['string','null'] },\n    referencia_trayecto: { type: ['string','null'] },\n    ubicacion: { type: ['string','null'] },\n    hora_estimada_llegada: { type: ['string','null'] },\n    nueva_fecha: { type: ['string','null'] },\n    vehiculo_inmovilizado: { type: ['boolean','null'] },\n    hay_heridos: { type: ['boolean','null'] },\n    descripcion_danos: { type: ['string','null'] },\n    nivel_combustible_o_bateria: { type: ['string','null'] },\n    posible_robo_o_fraude: { type: 'boolean' },\n    cliente_enfadado: { type: 'boolean' },\n    prioridad_sugerida: { type: 'string', enum: ['baja','media','alta','critica'] },\n    confianza: { type: 'number' },\n  },\n  required: ['tipo','resumen','emisor','matricula','conductor','cliente','ubicacion','vehiculo_inmovilizado','hay_heridos','posible_robo_o_fraude','cliente_enfadado','prioridad_sugerida','confianza'],\n};\nconst system = `Eres el clasificador de incidencias de una empresa de movimiento de vehículos con conductores profesionales.\nLee la incidencia y rellena la herramienta registrar_incidencia.\n- No inventes datos: si algo no aparece, usa null.\n- hay_heridos y vehiculo_inmovilizado: true/false solo si el texto lo deja claro; si no, null.\n- Matrícula sin espacios ni guiones (1234ABC).\n- confianza < 0.6 si el texto es ambiguo.`;\nreturn [{ json: {\n  incidencia: texto,\n  body: {\n    model: 'claude-sonnet-5-5',\n    max_tokens: 1024,\n    system,\n    tools: [{ name: 'registrar_incidencia', description: 'Registra los datos estructurados de una incidencia operativa.', input_schema: esquema }],\n    tool_choice: { type: 'tool', name: 'registrar_incidencia' },\n    messages: [{ role: 'user', content: texto }],\n  },\n}}];\n"
+      }
+    },
+    {
+      "id": "edf1cb84-67ca-408f-86bc-b7efcba2cb50",
+      "name": "Claude: clasificar y extraer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "a203bb50-089d-4080-85ea-e5d952036608",
+      "name": "Reglas de negocio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Misma lógica que agente/rules.py: el LLM extrae, el código decide.\nconst ex = ($json.content || []).find(b => b.type === 'tool_use')?.input || { tipo: 'otro', confianza: 0 };\nconst texto = $('Preparar petición a Claude').first().json.incidencia;\n\nconst OBLIG = {\n  averia: ['ubicacion','vehiculo_inmovilizado'],\n  accidente_danos: ['ubicacion','descripcion_danos','hay_heridos'],\n  retraso: ['hora_estimada_llegada'],\n  cliente_ausente: ['ubicacion','referencia_trayecto'],\n  llaves_documentacion: ['ubicacion','referencia_trayecto'],\n  combustible_carga: ['ubicacion','nivel_combustible_o_bateria'],\n  cambio_cita: ['referencia_trayecto','nueva_fecha'],\n  otro: [],\n};\nconst PRIO = ['baja','media','alta','critica'];\nconst MINIMA = { averia:'media', accidente_danos:'alta', retraso:'media', cliente_ausente:'media', llaves_documentacion:'media', combustible_carga:'baja', cambio_cita:'baja', otro:'baja' };\nconst ACCION = {\n  averia: 'Activar asistencia en carretera y coordinar con el conductor la espera o el traslado.',\n  accidente_danos: 'Abrir parte de daños, solicitar fotos y parte amistoso, y avisar al cliente.',\n  retraso: 'Notificar al cliente la nueva hora estimada de llegada y actualizar el trayecto.',\n  cliente_ausente: 'Contactar con el cliente por teléfono y fijar un tiempo máximo de espera para el conductor.',\n  llaves_documentacion: 'Localizar las llaves o la documentación con el punto de recogida y dar instrucciones al conductor.',\n  combustible_carga: 'Indicar al conductor la gasolinera o punto de carga más cercano y registrar el gasto.',\n  cambio_cita: 'Reprogramar el trayecto en la nueva fecha y confirmar con conductor y cliente.',\n  otro: 'Revisión manual por el equipo de operaciones.',\n};\nconst MENSAJE_AUTO = {\n  averia: 'Vamos a activar la asistencia en carretera. Quédate en un lugar seguro, con el chaleco puesto, y te confirmamos cuándo llega la grúa.',\n  accidente_danos: 'Hemos registrado el aviso de daños. Haz fotos del vehículo y no lo muevas hasta recibir instrucciones.',\n  retraso: 'Gracias por avisar. Informamos al cliente de la nueva hora de llegada; continúa el trayecto con normalidad.',\n  cliente_ausente: 'Vamos a contactar con el cliente. Espera en el punto de entrega y te damos instrucciones en cuanto sepamos algo.',\n  llaves_documentacion: 'Estamos localizando las llaves o la documentación con el punto de recogida. Te escribimos en cuanto tengamos instrucciones.',\n  combustible_carga: 'Puedes repostar o cargar en el punto más cercano. Guarda el ticket para que podamos registrar el gasto.',\n  cambio_cita: 'Hemos registrado tu petición de cambio de fecha. Te confirmaremos la nueva cita en breve.',\n  otro: 'Hemos recibido tu aviso y lo estamos revisando.',\n};\nconst NOMBRE = {\n  matricula: 'la matrícula del vehículo', ubicacion: 'la ubicación exacta',\n  vehiculo_inmovilizado: 'si el vehículo puede seguir circulando', descripcion_danos: 'una descripción de los daños (y fotos)',\n  hay_heridos: 'si hay alguna persona herida', hora_estimada_llegada: 'la nueva hora estimada de llegada',\n  referencia_trayecto: 'la referencia del trayecto o reserva', nivel_combustible_o_bateria: 'el nivel de combustible o batería',\n  nueva_fecha: 'la nueva fecha y hora deseada',\n};\nconst presente = v => v !== null && v !== undefined && !(typeof v === 'string' && !v.trim());\nconst tipo = OBLIG[ex.tipo] ? ex.tipo : 'otro';\n\nconst faltan = ['matricula', ...OBLIG[tipo]].filter(c => !presente(ex[c]));\n\nconst mayor = (a, b) => (PRIO.indexOf(a) >= PRIO.indexOf(b) ? a : b);\nlet prioridad = mayor(PRIO.includes(ex.prioridad_sugerida) ? ex.prioridad_sugerida : 'baja', MINIMA[tipo]);\nif (ex.hay_heridos === true) prioridad = 'critica';\nelse if (ex.vehiculo_inmovilizado === true) prioridad = mayor(prioridad, 'alta');\n\nconst motivos = [];\nif (ex.hay_heridos === true) motivos.push('Hay personas heridas.');\nif (tipo === 'accidente_danos') motivos.push('Accidente o daños: implica seguro y responsabilidad.');\nif (ex.posible_robo_o_fraude === true) motivos.push('Posible robo o fraude.');\nif (ex.vehiculo_inmovilizado === true) motivos.push('Vehículo inmovilizado.');\nif (ex.cliente_enfadado === true) motivos.push('Cliente muy molesto o con amenaza de reclamación.');\nif (tipo === 'otro') motivos.push('Tipo de incidencia no reconocido.');\nif (Number(ex.confianza || 0) < 0.6) motivos.push('Confianza de la clasificación baja.');\n\nlet decision, accion;\nif (motivos.length) {\n  decision = 'escalar_a_persona';\n  accion = 'Asignar a un agente de operaciones. ' + (faltan.length ? `Mientras tanto, pedir: ${faltan.join(', ')}. ` : '') + ACCION[tipo];\n} else if (faltan.length) {\n  decision = 'solicitar_informacion';\n  accion = 'Pedir automáticamente los datos que faltan: ' + faltan.join(', ') + '.';\n} else {\n  decision = 'resolver_automaticamente';\n  accion = ACCION[tipo];\n}\n\nconst destinatario = ex.emisor === 'cliente' ? 'cliente' : 'conductor';\nconst nombre = destinatario === 'cliente' ? ex.cliente : ex.conductor;\nconst pedir = faltan.map(c => NOMBRE[c] || c).join('; ');\nlet cuerpo;\nif (ex.hay_heridos === true) cuerpo = 'Si hay alguna persona herida, llama ahora mismo al 112. Un responsable de operaciones te va a llamar en unos minutos.';\nelse if (decision === 'escalar_a_persona') cuerpo = 'Hemos recibido tu aviso y un responsable de operaciones se pondrá en contacto contigo en breve.' + (pedir ? ` Mientras tanto, por favor envíanos: ${pedir}.` : '');\nelse if (decision === 'solicitar_informacion') cuerpo = `Hemos recibido tu aviso. Para poder ayudarte necesitamos que nos indiques: ${pedir}.`;\nelse cuerpo = MENSAJE_AUTO[tipo];\n\nreturn [{ json: {\n  procesado_en: new Date().toISOString(),\n  entrada: texto,\n  clasificacion: { tipo, resumen: ex.resumen, emisor: ex.emisor, confianza: ex.confianza },\n  entidades: {\n    matricula: ex.matricula ?? null, modelo_vehiculo: ex.modelo_vehiculo ?? null, conductor: ex.conductor ?? null,\n    telefono_contacto: ex.telefono_contacto ?? null, cliente: ex.cliente ?? null, referencia_trayecto: ex.referencia_trayecto ?? null,\n    ubicacion: ex.ubicacion ?? null, hora_estimada_llegada: ex.hora_estimada_llegada ?? null, nueva_fecha: ex.nueva_fecha ?? null,\n    vehiculo_inmovilizado: ex.vehiculo_inmovilizado ?? null, hay_heridos: ex.hay_heridos ?? null,\n    descripcion_danos: ex.descripcion_danos ?? null, nivel_combustible_o_bateria: ex.nivel_combustible_o_bateria ?? null,\n  },\n  prioridad,\n  informacion_faltante: faltan,\n  siguiente_accion: accion,\n  decision,\n  puede_resolverse_automaticamente: decision !== 'escalar_a_persona',\n  motivos_escalado: motivos,\n  comunicacion: { destinatario, mensaje: `${nombre ? 'Hola ' + nombre + ',' : 'Hola,'}\\n\\n${cuerpo}\\n\\nGracias,\\nEquipo de Operaciones` },\n}}];\n"
+      }
+    },
+    {
+      "id": "f80eac9d-3f64-4901-9d34-968920a82043",
+      "name": "Según decisión",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "45f79179-05b4-41ef-aa14-7fa905d26f3d",
+                    "leftValue": "={{ $json.decision }}",
+                    "rightValue": "resolver_automaticamente",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Automático"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "fa1a7f18-5ef5-476c-8061-23c8ac5a1287",
+                    "leftValue": "={{ $json.decision }}",
+                    "rightValue": "solicitar_informacion",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Pedir datos"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "93c79ea0-ba41-4af9-bbe7-f953b0235d73",
+                    "leftValue": "={{ $json.decision }}",
+                    "rightValue": "escalar_a_persona",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Escalar"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "912d3395-564c-4852-afef-28502190f77c",
+      "name": "Enviar respuesta automática",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        140
+      ],
+      "parameters": {},
+      "notes": "Aquí iría el envío real (SMS, WhatsApp, email) y la actualización del trayecto.",
+      "notesInFlow": true
+    },
+    {
+      "id": "9413e8a7-4969-43cf-ba3b-ce79e0b34b4b",
+      "name": "Pedir datos al remitente",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {},
+      "notes": "Aquí se enviaría el mensaje pidiendo los datos que faltan.",
+      "notesInFlow": true
+    },
+    {
+      "id": "e840d713-6ea8-40eb-8ea1-6646ed1524c3",
+      "name": "Crear ticket para operaciones",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        460
+      ],
+      "parameters": {},
+      "notes": "Aquí se crearía el ticket y se avisaría al equipo (Slack, email, herramienta interna).",
+      "notesInFlow": true
+    },
+    {
+      "id": "ca8df366-5b38-41b8-8c05-6b8b98897743",
+      "name": "Responder con JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Reglas de negocio').first().json) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: nueva incidencia": {
+      "main": [
+        [
+          {
+            "node": "Preparar petición a Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar petición a Claude": {
+      "main": [
+        [
+          {
+            "node": "Claude: clasificar y extraer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: clasificar y extraer": {
+      "main": [
+        [
+          {
+            "node": "Reglas de negocio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reglas de negocio": {
+      "main": [
+        [
+          {
+            "node": "Según decisión",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Según decisión": {
+      "main": [
+        [
+          {
+            "node": "Enviar respuesta automática",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Pedir datos al remitente",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Crear ticket para operaciones",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar respuesta automática": {
+      "main": [
+        [
+          {
+            "node": "Responder con JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pedir datos al remitente": {
+      "main": [
+        [
+          {
+            "node": "Responder con JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crear ticket para operaciones": {
+      "main": [
+        [
+          {
+            "node": "Responder con JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
